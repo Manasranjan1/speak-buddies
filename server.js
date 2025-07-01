@@ -34,8 +34,14 @@ const TOPICS = [
 ];
 
 // In-memory storage for user pairing
-let waitingUsers = [];
-let activeChannels = new Map();
+let connectionRequests = new Map(); // requestId -> request data
+let waitingQueue = []; // Array of request IDs waiting for pairing
+let activeChannels = new Map(); // channelName -> channel data
+
+// Generate unique request ID
+function generateRequestId() {
+    return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
 
 // Generate random channel name
 function generateChannelName() {
@@ -78,75 +84,165 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// Get token and pair users
-app.post('/api/get-token', (req, res) => {
+// Request connection - add user to queue or pair immediately
+app.post('/api/request-connection', (req, res) => {
     try {
-        const userId = req.body.userId || `user_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        const { userId } = req.body;
+        const requestId = generateRequestId();
+        const timestamp = Date.now();
         
-        // Check if there's a waiting user
-        if (waitingUsers.length > 0) {
-            // Pair with waiting user
-            const waitingUser = waitingUsers.shift();
-            const channelName = waitingUser.channelName;
-            const topic = waitingUser.topic;
+        // Create connection request
+        const request = {
+            requestId,
+            userId: userId || `user_${timestamp}`,
+            timestamp,
+            status: 'waiting'
+        };
+        
+        connectionRequests.set(requestId, request);
+        
+        // Check if there's someone waiting
+        if (waitingQueue.length > 0) {
+            // Pair with the first person in queue
+            const waitingRequestId = waitingQueue.shift();
+            const waitingRequest = connectionRequests.get(waitingRequestId);
             
-            // Generate tokens for both users
-            const token1 = generateAgoraToken(channelName, 1);
-            const token2 = generateAgoraToken(channelName, 2);
-            
-            // Store active channel
-            activeChannels.set(channelName, {
-                users: [waitingUser.userId, userId],
-                topic: topic,
-                startTime: Date.now(),
-                maxDuration: 10 * 60 * 1000 // 10 minutes
-            });
-            
-            // Respond to current user
-            res.json({
-                success: true,
-                token: token2,
-                channelName: channelName,
-                topic: topic,
-                appId: AGORA_APP_ID,
-                uid: 2,
-                paired: true
-            });
-            
-            console.log(`Paired users: ${waitingUser.userId} and ${userId} in channel ${channelName}`);
-            
+            if (waitingRequest && waitingRequest.status === 'waiting') {
+                // Create channel and pair both users
+                const channelName = generateChannelName();
+                const topic = getRandomTopic();
+                
+                // Generate tokens
+                const token1 = generateAgoraToken(channelName, 1);
+                const token2 = generateAgoraToken(channelName, 2);
+                
+                // Update both requests
+                waitingRequest.status = 'paired';
+                waitingRequest.channelName = channelName;
+                waitingRequest.topic = topic;
+                waitingRequest.token = token1;
+                waitingRequest.uid = 1;
+                
+                request.status = 'paired';
+                request.channelName = channelName;
+                request.topic = topic;
+                request.token = token2;
+                request.uid = 2;
+                
+                // Store active channel
+                activeChannels.set(channelName, {
+                    users: [waitingRequest.userId, request.userId],
+                    requests: [waitingRequestId, requestId],
+                    topic: topic,
+                    startTime: Date.now(),
+                    maxDuration: 10 * 60 * 1000 // 10 minutes
+                });
+                
+                console.log(`Paired users: ${waitingRequest.userId} and ${request.userId} in channel ${channelName}`);
+                
+                // Respond with pairing data
+                res.json({
+                    success: true,
+                    requestId: requestId,
+                    paired: true,
+                    token: token2,
+                    channelName: channelName,
+                    topic: topic,
+                    appId: AGORA_APP_ID,
+                    uid: 2
+                });
+                
+            } else {
+                // Waiting request was invalid, add current to queue
+                waitingQueue.push(requestId);
+                res.json({
+                    success: true,
+                    requestId: requestId,
+                    paired: false
+                });
+            }
         } else {
-            // No waiting user, add to queue
-            const channelName = generateChannelName();
-            const topic = getRandomTopic();
-            const token = generateAgoraToken(channelName, 1);
-            
-            waitingUsers.push({
-                userId: userId,
-                channelName: channelName,
-                topic: topic,
-                timestamp: Date.now()
-            });
-            
+            // No one waiting, add to queue
+            waitingQueue.push(requestId);
             res.json({
                 success: true,
-                token: token,
-                channelName: channelName,
-                topic: topic,
-                appId: AGORA_APP_ID,
-                uid: 1,
-                paired: false,
-                waiting: true
+                requestId: requestId,
+                paired: false
             });
-            
-            console.log(`User ${userId} added to waiting queue for channel ${channelName}`);
         }
         
     } catch (error) {
-        console.error('Error in get-token:', error);
+        console.error('Error in request-connection:', error);
         res.status(500).json({
             success: false,
-            error: 'Failed to generate token'
+            error: 'Failed to process connection request'
+        });
+    }
+});
+
+// Check if user has been paired
+app.get('/api/check-pairing/:requestId', (req, res) => {
+    try {
+        const { requestId } = req.params;
+        const request = connectionRequests.get(requestId);
+        
+        if (!request) {
+            return res.status(404).json({
+                success: false,
+                error: 'Request not found'
+            });
+        }
+        
+        if (request.status === 'paired') {
+            res.json({
+                success: true,
+                paired: true,
+                token: request.token,
+                channelName: request.channelName,
+                topic: request.topic,
+                appId: AGORA_APP_ID,
+                uid: request.uid
+            });
+        } else {
+            res.json({
+                success: true,
+                paired: false,
+                status: request.status
+            });
+        }
+        
+    } catch (error) {
+        console.error('Error in check-pairing:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to check pairing status'
+        });
+    }
+});
+
+// Cancel connection request
+app.post('/api/cancel-connection', (req, res) => {
+    try {
+        const { requestId } = req.body;
+        
+        // Remove from connection requests
+        connectionRequests.delete(requestId);
+        
+        // Remove from waiting queue
+        const queueIndex = waitingQueue.indexOf(requestId);
+        if (queueIndex > -1) {
+            waitingQueue.splice(queueIndex, 1);
+        }
+        
+        console.log(`Cancelled connection request: ${requestId}`);
+        
+        res.json({ success: true });
+        
+    } catch (error) {
+        console.error('Error cancelling connection:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to cancel connection'
         });
     }
 });
@@ -172,7 +268,7 @@ app.post('/api/end-call', (req, res) => {
     }
 });
 
-// Get active channels (for monitoring)
+// Get active channels and stats (for monitoring)
 app.get('/api/active-channels', (req, res) => {
     const channels = Array.from(activeChannels.entries()).map(([channelName, data]) => ({
         channelName,
@@ -184,28 +280,40 @@ app.get('/api/active-channels', (req, res) => {
     
     res.json({
         activeChannels: channels.length,
-        waitingUsers: waitingUsers.length,
+        waitingUsers: waitingQueue.length,
+        totalRequests: connectionRequests.size,
         channels: channels
     });
 });
 
-// Cleanup expired channels and waiting users
+// Cleanup expired channels, requests, and waiting users
 function cleanup() {
     const now = Date.now();
-    const WAITING_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    const REQUEST_TIMEOUT = 5 * 60 * 1000; // 5 minutes
     
-    // Remove expired waiting users
-    waitingUsers = waitingUsers.filter(user => {
-        const isExpired = (now - user.timestamp) > WAITING_TIMEOUT;
-        if (isExpired) {
-            console.log(`Removed expired waiting user: ${user.userId}`);
+    // Remove expired connection requests
+    for (const [requestId, request] of connectionRequests.entries()) {
+        if (request.status === 'waiting' && (now - request.timestamp) > REQUEST_TIMEOUT) {
+            connectionRequests.delete(requestId);
+            
+            // Remove from waiting queue
+            const queueIndex = waitingQueue.indexOf(requestId);
+            if (queueIndex > -1) {
+                waitingQueue.splice(queueIndex, 1);
+            }
+            
+            console.log(`Removed expired request: ${requestId}`);
         }
-        return !isExpired;
-    });
+    }
     
     // Remove expired active channels
     for (const [channelName, data] of activeChannels.entries()) {
         if ((now - data.startTime) > data.maxDuration) {
+            // Clean up associated requests
+            data.requests.forEach(reqId => {
+                connectionRequests.delete(reqId);
+            });
+            
             activeChannels.delete(channelName);
             console.log(`Removed expired channel: ${channelName}`);
         }
@@ -237,7 +345,9 @@ app.listen(PORT, () => {
     console.log(`SpeakBuddies server running on port ${PORT}`);
     console.log(`Agora App ID: ${AGORA_APP_ID}`);
     console.log(`Available endpoints:`);
-    console.log(`  POST /api/get-token - Get Agora token and pair users`);
+    console.log(`  POST /api/request-connection - Request pairing with another user`);
+    console.log(`  GET /api/check-pairing/:requestId - Check if user has been paired`);
+    console.log(`  POST /api/cancel-connection - Cancel connection request`);
     console.log(`  POST /api/end-call - End active call`);
     console.log(`  GET /api/active-channels - Get server statistics`);
     console.log(`  GET /api/health - Health check`);
